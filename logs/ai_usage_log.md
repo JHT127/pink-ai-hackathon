@@ -1,7 +1,8 @@
 # AI Usage Log
 
-| #   | Stage   | What we asked the AI                       | What it produced                                      | What we checked or changed                                                         |
-| --- | ------- | ------------------------------------------ | ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| 1   | Stage 1 | Set up the repo structure and rules file   | Folders, templates, config                            | Reviewed the structure and rules                                                   |
-| 2   | Stage 2 | Load and inspect raw data without cleaning | Raw-data loader, inspection helpers, notebook reports | Confirmed raw values remain text and ran the notebook top to bottom                |
-| 3   | Stage 3 | Apply fixed easy-cleaning rules            | Stage 3 cleaner, diagnostics, and cleaned CSVs        | Checked train/test rules, preserved raw inputs, and ran the notebook top to bottom |
+| #   | Stage   | What we asked the AI                       | What it produced                                                | What we checked or changed                                                            |
+| --- | ------- | ------------------------------------------ | --------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| 1   | Stage 1 | Set up the repo structure and rules file   | Folders, templates, config                                      | Reviewed the structure and rules                                                      |
+| 2   | Stage 2 | Load and inspect raw data without cleaning | Raw-data loader, inspection helpers, notebook reports           | Confirmed raw values remain text and ran the notebook top to bottom                   |
+| 3   | Stage 3 | Apply fixed easy-cleaning rules            | Stage 3 cleaner, diagnostics, and cleaned CSVs                  | Checked train/test rules, preserved raw inputs, and ran the notebook top to bottom    |
+| 4   | Stage 4 | Diagnose and repair structural data issues | Geometry diagnostics, conservative repairs, and Stage 4 outputs | Checked scale evidence, preserved raw inputs, and validated train/test row invariants |
