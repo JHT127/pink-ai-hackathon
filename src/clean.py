@@ -94,6 +94,35 @@ def clean_text_columns(df):
     )
 
 
+def normalise_patient_id(df):
+    """Keep the source identifier and normalize patient IDs to digits only."""
+    result = df.copy()
+    if "patient_id" not in result.columns:
+        return result, _entry(
+            "Patient identifiers",
+            "patient_id, patient_id_raw",
+            0,
+            "Skipped because patient_id is absent.",
+            "No patient identifier was available to normalize.",
+        )
+    original = result["patient_id"].copy()
+    text = original.astype("string").str.strip()
+    text = text.str.replace(r"(?i)^ID-", "", regex=True)
+    text = text.str.replace(r"\.0+$", "", regex=True)
+    normalized = text.str.replace(r"\D", "", regex=True)
+    normalized = normalized.mask(normalized.eq(""), pd.NA)
+    changed = int((original.astype("string") != normalized).fillna(False).sum())
+    result["patient_id_raw"] = original
+    result["patient_id"] = normalized
+    return result, _entry(
+        "Patient identifiers with prefixes or punctuation",
+        "patient_id, patient_id_raw",
+        changed,
+        f"Preserved the source value in patient_id_raw and normalized {changed} identifiers to digits only.",
+        "Duplicate detection and grouped validation must use one canonical patient key.",
+    )
+
+
 def fix_fake_missing(df):
     """Replace configured missing-value spellings in numeric fields with NaN."""
     result = df.copy()
@@ -319,6 +348,7 @@ def clean_stage3(df):
     entries = []
     for cleaning_function in (
         rename_columns,
+        normalise_patient_id,
         clean_text_columns,
         fix_fake_missing,
         parse_numbers,

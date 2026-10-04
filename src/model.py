@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin, clone
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -15,6 +15,36 @@ from sklearn.preprocessing import StandardScaler
 
 from src.config import FEATURES_DROP, ID_COL, RANDOM_SEED, SAMPLE_SUBMISSION, SUBMISSIONS_DIR
 from src.repair import MEASUREMENT_COLUMNS
+
+
+DEFAULT_VARIANT = "base"
+MODEL_VARIANTS = ("base", "winsorize", "ratios", "winsorize+ratios")
+
+
+class Winsorizer(TransformerMixin, BaseEstimator):
+    """Clip features to fold-fitted 0.5th and 99.5th percentiles."""
+
+    def fit(self, X, y=None):
+        values = np.asarray(X, dtype=float)
+        self.lower_ = np.nanquantile(values, 0.005, axis=0)
+        self.upper_ = np.nanquantile(values, 0.995, axis=0)
+        return self
+
+    def transform(self, X):
+        values = np.asarray(X, dtype=float)
+        return np.clip(values, self.lower_, self.upper_)
+
+
+class RatioFeatureAdder(TransformerMixin, BaseEstimator):
+    """Add deterministic measurement ratios while retaining feature names."""
+
+    def fit(self, X, y=None):
+        self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        return self
+
+    def transform(self, X):
+        frame = pd.DataFrame(X, columns=self.feature_names_in_)
+        return add_ratio_features(frame)
 
 
 class BlendClassifier(ClassifierMixin, BaseEstimator):
@@ -57,20 +87,57 @@ def get_features(df):
     return df.loc[:, features].apply(pd.to_numeric, errors="coerce")
 
 
-def make_models():
-    """Create fresh model templates for fold-wise fitting."""
-    logreg = Pipeline(
-        [
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-            ("classifier", LogisticRegression(C=1.0, max_iter=2000)),
-        ]
+def add_ratio_features(df):
+    """Return a copy with the four requested ratios; zero denominators become NaN."""
+    result = df.copy()
+    ratios = {
+        "perimeter_mean_radius_mean_ratio": ("perimeter_mean", "radius_mean"),
+        "area_mean_radius_mean_squared_ratio": ("area_mean", "radius_mean", 2),
+        "radius_worst_radius_mean_ratio": ("radius_worst", "radius_mean"),
+        "concavity_worst_concavity_mean_ratio": ("concavity_worst", "concavity_mean"),
+    }
+    for feature, terms in ratios.items():
+        numerator = pd.to_numeric(result[terms[0]], errors="coerce")
+        denominator = pd.to_numeric(result[terms[1]], errors="coerce")
+        if len(terms) == 3:
+            denominator = denominator.pow(terms[2])
+        result[feature] = numerator.div(denominator.where(denominator.ne(0)))
+    return result
+
+
+def _model_pipeline(classifier, variant, scale=False):
+    steps = []
+    if "ratios" in variant:
+        steps.append(("ratio_features", RatioFeatureAdder()))
+    if "winsorize" in variant:
+        steps.append(("winsorizer", Winsorizer()))
+    if scale:
+        steps.extend(
+            [
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]
+        )
+    steps.append(("classifier", classifier))
+    return Pipeline(steps)
+
+
+def make_models(variant=None):
+    """Create fresh model templates using the requested preprocessing variant."""
+    selected_variant = DEFAULT_VARIANT if variant is None else variant
+    if selected_variant not in MODEL_VARIANTS:
+        raise ValueError(f"Unknown model variant: {selected_variant}")
+    logreg = _model_pipeline(
+        LogisticRegression(C=1.0, max_iter=2000), selected_variant, scale=True
     )
-    hgb = HistGradientBoostingClassifier(
+    hgb = _model_pipeline(
+        HistGradientBoostingClassifier(
         max_depth=4,
         learning_rate=0.05,
         max_iter=300,
         random_state=RANDOM_SEED,
+        ),
+        selected_variant,
     )
     return {"logreg": logreg, "hgb": hgb, "blend": BlendClassifier(logreg, hgb)}
 
@@ -120,6 +187,165 @@ def metrics(y, p):
         "recall_at_precision": float(recall),
         "threshold_at_precision": float(threshold),
     }
+
+
+def measurement_outlier_report(df):
+    """Summarize six-IQR outlier shares and five most extreme values per measure."""
+    rows = []
+    for column in MEASUREMENT_COLUMNS:
+        values = pd.to_numeric(df[column], errors="coerce")
+        observed = values.dropna()
+        median = float(observed.median())
+        lower_quartile = float(observed.quantile(0.25))
+        upper_quartile = float(observed.quantile(0.75))
+        spread = upper_quartile - lower_quartile
+        outside = observed.lt(median - 6 * spread) | observed.gt(median + 6 * spread)
+        extreme_values = (
+            observed.loc[(observed - median).abs().sort_values(ascending=False).index]
+            .head(5)
+            .tolist()
+        )
+        rows.append(
+            {
+                "column": column,
+                "n": int(len(observed)),
+                "beyond_6_iqr": int(outside.sum()),
+                "share_beyond_6_iqr": float(outside.mean()) if len(observed) else np.nan,
+                "five_most_extreme_values": extreme_values,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(
+        ["share_beyond_6_iqr", "beyond_6_iqr"], ascending=False
+    ).reset_index(drop=True)
+
+
+def compare_model_variants(X, y, groups):
+    """Evaluate logistic regression and HGB on identical patient-grouped OOF folds."""
+    prediction_map = {}
+    metric_rows = []
+    for variant in MODEL_VARIANTS:
+        predictions = oof_predictions(
+            {name: model for name, model in make_models(variant).items() if name in {"hgb", "logreg"}},
+            X,
+            y,
+            groups,
+        )
+        for name, probability in predictions.items():
+            prediction_map[(variant, name)] = probability
+            metric_rows.append(
+                {"variant": variant, "model": name, **metrics(y, probability)}
+            )
+    return pd.DataFrame(metric_rows), prediction_map
+
+
+def best_model_variant(comparison, minimum_auc_gain=0.003):
+    """Return the highest-AUC HGB variant meeting the minimum gain over base."""
+    hgb = comparison.loc[comparison["model"].eq("hgb")].set_index("variant")
+    base_auc = float(hgb.loc["base", "roc_auc"])
+    eligible = hgb.loc[hgb["roc_auc"].ge(base_auc + minimum_auc_gain)]
+    if eligible.empty:
+        return "base"
+    return str(eligible["roc_auc"].idxmax())
+
+
+def threshold_options(y, probability, groups, n_bootstrap=200):
+    """Return natural and prevalence-weighted threshold metrics with patient bootstrap p05."""
+    target = np.asarray(y, dtype=int)
+    predicted_probability = np.asarray(probability, dtype=float)
+    group_values = pd.Series(groups).astype("string").fillna("__missing__")
+    if len(target) != len(predicted_probability) or len(target) != len(group_values):
+        raise ValueError("y, probability, and groups must have equal lengths")
+    prevalence = float(target.mean())
+    group_codes, unique_groups = pd.factorize(group_values, sort=False)
+    rng = np.random.default_rng(RANDOM_SEED)
+    bootstrap_weights = np.zeros((n_bootstrap, len(unique_groups)), dtype=np.int16)
+    for sample_index in range(n_bootstrap):
+        sampled = rng.integers(0, len(unique_groups), size=len(unique_groups))
+        bootstrap_weights[sample_index] = np.bincount(
+            sampled, minlength=len(unique_groups)
+        )
+
+    rows = []
+    for threshold in np.round(np.arange(0.50, 1.00, 0.01), 2):
+        predicted = predicted_probability >= threshold
+        true_positive = predicted & (target == 1)
+        false_positive = predicted & (target == 0)
+        tp = int(true_positive.sum())
+        fp = int(false_positive.sum())
+        total_predicted = tp + fp
+        natural_precision = tp / total_predicted if total_predicted else 0.0
+        recall = tp / int((target == 1).sum()) if (target == 1).any() else 0.0
+        group_tp = np.bincount(group_codes, weights=true_positive, minlength=len(unique_groups))
+        group_fp = np.bincount(group_codes, weights=false_positive, minlength=len(unique_groups))
+        bootstrap_tp = bootstrap_weights @ group_tp
+        bootstrap_fp = bootstrap_weights @ group_fp
+        bootstrap_precision = np.divide(
+            bootstrap_tp,
+            bootstrap_tp + bootstrap_fp,
+            out=np.zeros(n_bootstrap, dtype=float),
+            where=(bootstrap_tp + bootstrap_fp) > 0,
+        )
+        row = {
+            "threshold": float(threshold),
+            "precision_39": natural_precision,
+            "recall": recall,
+            "bootstrap_p05_39": float(np.percentile(bootstrap_precision, 5)),
+        }
+        for share in (0.30, 0.22, 0.15):
+            benign_weight = prevalence * (1 - share) / (share * (1 - prevalence))
+            weighted_fp = fp * benign_weight
+            row[f"precision_{int(share * 100)}"] = (
+                tp / (tp + weighted_fp) if tp + weighted_fp else 0.0
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def highest_recall_thresholds(table, precision_floor=0.92):
+    """Find the highest-recall threshold meeting a precision floor at each share."""
+    rows = []
+    for share, column in (
+        (0.39, "precision_39"),
+        (0.30, "precision_30"),
+        (0.22, "precision_22"),
+        (0.15, "precision_15"),
+    ):
+        eligible = table.loc[table[column].ge(precision_floor)]
+        if eligible.empty:
+            rows.append(
+                {"malignant_share": share, "threshold": np.nan, "precision": np.nan, "recall": np.nan}
+            )
+            continue
+        selected = eligible.loc[eligible["recall"].idxmax()]
+        rows.append(
+            {
+                "malignant_share": share,
+                "threshold": float(selected["threshold"]),
+                "precision": float(selected[column]),
+                "recall": float(selected["recall"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def plot_threshold_options(table, output_path):
+    """Save the four prevalence-specific precision curves and recall curve."""
+    import matplotlib.pyplot as plt
+
+    figure, axis = plt.subplots(figsize=(9, 5.5))
+    for share, column in (
+        (39, "precision_39"),
+        (30, "precision_30"),
+        (22, "precision_22"),
+        (15, "precision_15"),
+    ):
+        axis.plot(table["threshold"], table[column], label=f"Precision, M share {share}%")
+    axis.plot(table["threshold"], table["recall"], color="black", linestyle="--", label="Recall")
+    axis.set(xlabel="Threshold", ylabel="Score", ylim=(0, 1), title="OOF precision and recall options")
+    axis.legend()
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=160)
+    plt.close(figure)
 
 
 def center_holdout(models, df, X, y):
