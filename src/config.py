@@ -14,6 +14,7 @@ TRAIN_RAW = RAW_DIR / "pinkai_train.csv"
 TEST_RAW = RAW_DIR / "pinkai_test.csv"
 SAMPLE_SUBMISSION = RAW_DIR / "sample_submission.csv"
 RANDOM_SEED = 42
+TEAM_NAME = "TEAM"
 TARGET = "diagnosis"
 ID_COL = "patient_id"
 FEATURES_DROP = [
