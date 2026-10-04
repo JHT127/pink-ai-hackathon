@@ -16,3 +16,15 @@ SAMPLE_SUBMISSION = RAW_DIR / "sample_submission.csv"
 RANDOM_SEED = 42
 TARGET = "diagnosis"
 ID_COL = "patient_id"
+FEATURES_DROP = [
+    "biopsy_followup_code",
+    "sample_ref",
+    "notes",
+    "patient_id",
+    "exam_date",
+    "exam_date_raw",
+    "flag_unit_fixed",
+    "flag_sign_fixed",
+    "flag_comma_resolved",
+    "flag_merged_duplicate",
+]
