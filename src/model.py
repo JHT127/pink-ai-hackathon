@@ -165,6 +165,94 @@ def oof_predictions(models, X, y, groups):
     return predictions
 
 
+def fit_with_noise_filter(X, y, groups, model_factory, threshold=0.10):
+    """Fit a model after removing rows with low inner-OOF probability for their label.
+
+    Returns the fitted estimator, a Boolean keep mask, and each row's inner-OOF
+    probability for its observed label. Filtering is confined to these inputs.
+    """
+    target = np.asarray(y, dtype=int)
+    group_values = np.asarray(groups)
+    if len(X) != len(target) or len(target) != len(group_values):
+        raise ValueError("X, y, and groups must have equal lengths")
+    if not 0 <= threshold <= 1:
+        raise ValueError("threshold must be between 0 and 1")
+
+    own_label_probability = np.full(len(target), np.nan, dtype=float)
+    splitter = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=RANDOM_SEED)
+    for train_index, validation_index in splitter.split(X, target, group_values):
+        train_groups = set(group_values[train_index])
+        validation_groups = set(group_values[validation_index])
+        assert train_groups.isdisjoint(validation_groups)
+        fitted = clone(model_factory()).fit(X.iloc[train_index], target[train_index])
+        class_index = int(np.flatnonzero(fitted.classes_ == 1)[0])
+        probability = fitted.predict_proba(X.iloc[validation_index])[:, class_index]
+        own_label_probability[validation_index] = np.where(
+            target[validation_index] == 1, probability, 1 - probability
+        )
+
+    if not np.isfinite(own_label_probability).all():
+        raise ValueError("Inner grouped OOF filtering did not score every training row")
+    keep_mask = own_label_probability >= threshold
+    if len(np.unique(target[keep_mask])) < 2:
+        raise ValueError("Noise filter retained fewer than two label classes")
+    final_model = clone(model_factory()).fit(X.iloc[keep_mask], target[keep_mask])
+    return final_model, keep_mask, own_label_probability
+
+
+def compare_noise_filter(X, y, groups, model_factory, threshold=0.10):
+    """Compare plain and filtered models on identical outer patient-grouped OOF folds."""
+    target = np.asarray(y, dtype=int)
+    group_values = np.asarray(groups)
+    if len(X) != len(target) or len(target) != len(group_values):
+        raise ValueError("X, y, and groups must have equal lengths")
+    predictions = {
+        "plain": np.full(len(target), np.nan, dtype=float),
+        "filtered": np.full(len(target), np.nan, dtype=float),
+    }
+    removed_rows = 0
+    training_rows = 0
+    splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    for train_index, validation_index in splitter.split(X, target, group_values):
+        train_groups = set(group_values[train_index])
+        validation_groups = set(group_values[validation_index])
+        assert train_groups.isdisjoint(validation_groups)
+
+        plain_model = clone(model_factory()).fit(X.iloc[train_index], target[train_index])
+        class_index = int(np.flatnonzero(plain_model.classes_ == 1)[0])
+        predictions["plain"][validation_index] = plain_model.predict_proba(
+            X.iloc[validation_index]
+        )[:, class_index]
+
+        filtered_model, keep_mask, _ = fit_with_noise_filter(
+            X.iloc[train_index],
+            target[train_index],
+            group_values[train_index],
+            model_factory,
+            threshold=threshold,
+        )
+        class_index = int(np.flatnonzero(filtered_model.classes_ == 1)[0])
+        predictions["filtered"][validation_index] = filtered_model.predict_proba(
+            X.iloc[validation_index]
+        )[:, class_index]
+        removed_rows += int((~keep_mask).sum())
+        training_rows += len(train_index)
+
+    if any(not np.isfinite(values).all() for values in predictions.values()):
+        raise ValueError("Outer grouped OOF evaluation did not predict every row")
+    removed_share = removed_rows / training_rows if training_rows else 0.0
+    rows = []
+    for name, probability in predictions.items():
+        rows.append(
+            {
+                "variant": name,
+                **metrics(target, probability),
+                "share_training_rows_removed": removed_share if name == "filtered" else 0.0,
+            }
+        )
+    return pd.DataFrame(rows), predictions
+
+
 def metrics(y, p):
     """Calculate ranking, calibration, and recall at 90% precision."""
     target = np.asarray(y, dtype=int)
@@ -290,6 +378,8 @@ def threshold_options(y, probability, groups, n_bootstrap=200):
             "precision_39": natural_precision,
             "recall": recall,
             "bootstrap_p05_39": float(np.percentile(bootstrap_precision, 5)),
+            "TP": tp,
+            "FP": fp,
         }
         for share in (0.30, 0.22, 0.15):
             benign_weight = prevalence * (1 - share) / (share * (1 - prevalence))
@@ -515,3 +605,64 @@ def make_submission(model, X_train, y_train, test_df, threshold, team_name):
     print(f"Submission checks passed: {len(saved)} rows, 3 columns, IDs unique and aligned, no NaN.")
     print(f"Test predicted M share: {(predicted_label == 'M').mean():.4f}")
     return submission
+
+
+def write_candidate_submissions(test_df, probability, thresholds=(0.85, 0.90), team_name="TEAM"):
+    """Write validated threshold candidates from one shared test probability vector."""
+    if ID_COL not in test_df.columns:
+        raise ValueError(f"Submission input is missing {ID_COL}")
+    probability = np.asarray(probability, dtype=float)
+    if len(probability) != len(test_df):
+        raise ValueError("Test rows and probabilities must have equal lengths")
+    if not np.isfinite(probability).all() or not ((probability >= 0) & (probability <= 1)).all():
+        raise ValueError("Submission probabilities must be finite and in [0, 1]")
+
+    sample = pd.read_csv(SAMPLE_SUBMISSION, dtype={ID_COL: "string"})
+    if len(sample) != 2884 or len(test_df) != 2884:
+        raise ValueError("Candidate submissions require exactly 2,884 test and sample rows")
+    test_keys = test_df[ID_COL].map(_id_key)
+    sample_keys = sample[ID_COL].map(_id_key)
+    if test_keys.duplicated().any() or sample_keys.duplicated().any():
+        raise ValueError("Test and sample submission patient_ids must each be unique")
+    if set(test_keys) != set(sample_keys):
+        raise ValueError("Test patient_ids do not match the sample submission")
+
+    probability_by_key = pd.Series(probability, index=test_keys)
+    if probability_by_key.isna().any():
+        raise ValueError("Candidate probabilities could not be aligned to sample patient_ids")
+    aligned_probability = probability_by_key.reindex(sample_keys).to_numpy()
+    output_dir = Path(SUBMISSIONS_DIR) / "candidates"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    outputs = {}
+    for threshold in thresholds:
+        label = f"t{int(round(threshold * 100)):03d}"
+        submission = pd.DataFrame(
+            {
+                ID_COL: sample[ID_COL],
+                "predicted_label": np.where(aligned_probability >= threshold, "M", "B"),
+                "predicted_prob": aligned_probability,
+            }
+        )
+        if list(submission.columns) != [ID_COL, "predicted_label", "predicted_prob"]:
+            raise ValueError("Submission must contain exactly the three required columns")
+        if submission.isna().any().any():
+            raise ValueError("Submission contains missing values")
+        if not submission["predicted_label"].isin(["M", "B"]).all():
+            raise ValueError("Submission labels must be M or B")
+        if not submission["predicted_prob"].between(0, 1).all():
+            raise ValueError("Submission probabilities must be in [0, 1]")
+
+        output_path = output_dir / f"{team_name}_{label}.csv"
+        submission.to_csv(output_path, index=False, float_format="%.6f")
+        saved = pd.read_csv(output_path, dtype={ID_COL: "string"})
+        if len(saved) != 2884 or saved.isna().any().any():
+            raise ValueError("Written candidate failed row-count or missing-value validation")
+        if not saved[ID_COL].equals(sample[ID_COL]):
+            raise ValueError("Written candidate patient_ids are not in sample order")
+        if not saved["predicted_label"].isin(["M", "B"]).all():
+            raise ValueError("Written candidate labels must be M or B")
+        if not saved["predicted_prob"].between(0, 1).all():
+            raise ValueError("Written candidate probabilities must be in [0, 1]")
+        outputs[threshold] = submission
+        print(f"{output_path.name}: test predicted M share={(submission['predicted_label'] == 'M').mean():.4f}")
+    return outputs
